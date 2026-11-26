@@ -272,6 +272,12 @@ class Settings(BaseSettings):
     # and the indexer rolls the whole document back.
     embedding_concurrency: int = Field(default=8, ge=1, le=64)
     embedding_timeout: int = Field(default=60, ge=5, le=600)
+    # 多模态向量端点（DashScope 原生 multimodal-embedding）；留空使用官方默认地址。
+    # 仅在 embedding 模型属于多模态家族（qwen3-vl-embedding 等）时生效。
+    embedding_multimodal_endpoint: str | None = None
+    # 多模态模型的请求维度（如 qwen3-vl-embedding 默认 2560）。
+    # 留空时沿用 effective_embedding_request_dimensions。
+    embedding_multimodal_dimension: int | None = Field(default=None, ge=1)
 
     # ── 文档解析（进入 zleap-sag 前统一转为 Markdown）─────────────────
     # auto：PDF 优先 MinerU，未配置或 MinerU 失败时回退本地 MarkItDown。
@@ -481,11 +487,19 @@ class Settings(BaseSettings):
 
     @property
     def effective_embedding_api_key(self) -> str | None:
+        from sag_api.core.embedding_policy import is_multimodal_embedding_model
+
+        if is_multimodal_embedding_model(self.embedding_model):
+            return self.embedding_api_key
         provider = get_model_provider(self.llm_provider)
         return self.embedding_api_key or (self.llm_api_key if provider.can_reuse_embedding_credentials else None)
 
     @property
     def effective_embedding_base_url(self) -> str | None:
+        from sag_api.core.embedding_policy import DASHSCOPE_MULTIMODAL_ENDPOINT, is_multimodal_embedding_model
+
+        if is_multimodal_embedding_model(self.embedding_model):
+            return self.embedding_multimodal_endpoint or DASHSCOPE_MULTIMODAL_ENDPOINT
         provider = get_model_provider(self.llm_provider)
         return self.embedding_base_url or (self.llm_base_url if provider.can_reuse_embedding_credentials else None)
 
@@ -507,6 +521,10 @@ class Settings(BaseSettings):
         未显式配置时跟随 schema 维度，逐字保留 0.12.0 的行为；只有已知拒绝该参数的
         服务商/模型组合才省略（旧版由 engine_manager 在引擎初始化后绕过）。
         """
+        from sag_api.core.embedding_policy import is_multimodal_embedding_model
+
+        if is_multimodal_embedding_model(self.embedding_model) and self.embedding_multimodal_dimension is not None:
+            return self.embedding_multimodal_dimension
         for value in (self.embedding_request_dimensions, self.embedding_dimensions):
             if value is not None:
                 return value

@@ -2,6 +2,14 @@
 
 from urllib.parse import urlsplit
 
+DASHSCOPE_MULTIMODAL_ENDPOINT = (
+    "https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding"
+)
+
+
+def is_multimodal_embedding_model(model: str | None) -> bool:
+    return (model or "").strip().lower() == "qwen3-vl-embedding"
+
 
 def _batch_limit(config):
     if config is None:
