@@ -5,7 +5,7 @@ import { Check, Plug, Save, X } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { SettingsRow, SettingsSection } from "@/components/features/settings-section";
 import { Button } from "@/components/ui/button";
-import { Field, FieldLabel } from "@/components/ui/field";
+import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
@@ -171,6 +171,8 @@ export function ChatbotConfigSections() {
   if (!config) return <p>{c("loading")}</p>;
 
   const disabled = (target: Target) => config.locked || saving[target] || testing[target];
+  // Qwen3-VL-Embedding 只有百炼原生多模态端点：查询连接不能覆盖端点，只允许覆盖 Key。
+  const isVlEmbedding = config.embedding.model.trim().toLowerCase() === "qwen3-vl-embedding";
   const providerFamily = config.llm.provider === "responses" ? "openai" : config.llm.provider;
   const changeLlmProvider = (value: ModelProviderId) => {
     update("llm", "provider", value);
@@ -178,17 +180,20 @@ export function ChatbotConfigSections() {
       update("llm", "responses_endpoint", "https://api.openai.com/v1/responses");
     }
   };
-  const input = (target: Target, field: string, label: string, type = "text") => <Field>
+  const input = (target: Target, field: string, label: string, type = "text",
+    options?: { disabled?: boolean; placeholder?: string; help?: string; value?: string }) => <Field>
     <FieldLabel htmlFor={`chatbot-${target}-${field}`}>{label}</FieldLabel>
-    <Input id={`chatbot-${target}-${field}`} aria-label={label} type={type} disabled={disabled(target)}
-      value={String(config[target][field as keyof Connection] ?? "")}
+    <Input id={`chatbot-${target}-${field}`} aria-label={label} type={type} disabled={options?.disabled || disabled(target)}
+      value={options?.value ?? String(config[target][field as keyof Connection] ?? "")}
+      placeholder={options?.placeholder}
       onChange={e => update(target, field, e.target.value)} autoComplete="off" />
+    {options?.help && <FieldDescription>{options.help}</FieldDescription>}
   </Field>;
-  const keyInput = (target: Target) => <Field>
+  const keyInput = (target: Target, placeholder?: string) => <Field>
     <FieldLabel htmlFor={`chatbot-${target}-api-key`}>{c("optionalKey")}</FieldLabel>
     <Input id={`chatbot-${target}-api-key`} aria-label={`${target} API Key`} type="password" value={keys[target]} autoComplete="new-password"
       disabled={disabled(target)} onChange={e => setKeys(current => ({ ...current, [target]: e.target.value }))}
-      placeholder={config[target].api_key_set ? (c("keyConfigured")) : (c("keyPlaceholder"))} />
+      placeholder={config[target].api_key_set ? (c("keyConfigured")) : (placeholder ?? c("keyPlaceholder"))} />
   </Field>;
   const controls = (target: Target) => <div className="flex flex-col gap-3">
     <div className="min-w-0 space-y-2">
@@ -278,7 +283,15 @@ export function ChatbotConfigSections() {
         <p className="text-sm">{config.embedding.model} · {c("schemaDimensions")}: {config.embedding.schema_dimensions} · {c("requestDimensions")}: {config.embedding.request_dimensions ?? (c("omitted"))}</p>
       </SettingsRow>
       <SettingsRow title={c("queryConnection")}><div className="grid gap-4 sm:grid-cols-2">
-        {input("embedding", "base_url", c("queryEndpoint"))}{keyInput("embedding")}
+        {isVlEmbedding
+          ? input("embedding", "base_url", c("queryEndpoint"), "text", {
+            disabled: true,
+            value: "",
+            placeholder: c("queryEndpointInherited"),
+            help: c("queryEndpointInheritedHelp"),
+          })
+          : input("embedding", "base_url", c("queryEndpoint"))}
+        {keyInput("embedding", isVlEmbedding ? c("embeddingKeyReuseMain") : undefined)}
       </div></SettingsRow>
     </SettingsSection>
   </>;

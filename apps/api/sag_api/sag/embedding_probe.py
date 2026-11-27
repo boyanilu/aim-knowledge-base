@@ -6,10 +6,10 @@ import math
 from typing import NotRequired, TypedDict
 
 from zleap.sag.config import EmbeddingConfig
-from zleap.sag.core.adapters.defaults import OpenAIEmbeddingAdapter
 from zleap.sag.exceptions import AIAuthError, AIError, AIInvalidRequestError, AITransientError
 
 from sag_api.core.config import Settings
+from sag_api.sag.embedding_factory import create_embedding
 
 
 class EmbeddingConnectionTestResult(TypedDict):
@@ -25,7 +25,7 @@ async def probe_embedding_connection(configuration: Settings) -> EmbeddingConnec
         return {"ok": False, "message": "No embedding API key configured"}
     try:
         # Use the original adapter directly; query connections cannot replace this test.
-        adapter = OpenAIEmbeddingAdapter(
+        adapter = create_embedding(
             config=EmbeddingConfig(
                 model=configuration.embedding_model,
                 api_key=configuration.effective_embedding_api_key,

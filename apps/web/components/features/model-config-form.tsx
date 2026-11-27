@@ -44,6 +44,13 @@ function is302Api(url: string | null) {
   }
 }
 
+/** Qwen3-VL-Embedding 走 DashScope 原生多模态端点，不使用 OpenAI 兼容地址。 */
+const VL_EMBEDDING_MODEL_ID = "qwen3-vl-embedding";
+
+function isVlEmbeddingModel(model: string): boolean {
+  return model.trim().toLowerCase() === VL_EMBEDDING_MODEL_ID;
+}
+
 type BaseTarget = "generation" | "embedding" | "parser";
 const belongsTo = (target: BaseTarget, key: string) => target === "generation" ? key.startsWith("llm_")
   : target === "embedding" ? key.startsWith("embedding_") : key === "document_parser" || key.startsWith("mineru_");
@@ -172,7 +179,8 @@ function BaseModelConfigForm() {
       llm_structured_output_mode: structuredMode,
       llm_context_window: ctxWindow,
       embedding_model: embModel.trim(),
-      embedding_base_url: embBaseUrl.trim(),
+      // VL 模型固定使用原生端点；即使内部 state 仍残留旧地址，也不提交它
+      embedding_base_url: isVlEmbeddingModel(embModel) ? "" : embBaseUrl.trim(),
       embedding_dimensions: embDims.trim() ? Number(embDims) : null,
       document_parser: documentParser,
       mineru_provider: mineruProvider,
@@ -445,21 +453,25 @@ function BaseModelConfigForm() {
   const embeddingUrl = embBaseUrl.trim();
   const generationUrl = cfg.llm_base_url?.trim() ?? "";
   const savedProviderSpec = providers.find(provider => provider.id === cfg.llm_provider)!;
+  const isVlEmbedding = isVlEmbeddingModel(embModel);
+  const canInheritEmbedding = !isVlEmbedding && savedProviderSpec.can_reuse_embedding_credentials;
   let embeddingAddressPlaceholder: string;
-  if (!savedProviderSpec.can_reuse_embedding_credentials) {
+  if (!canInheritEmbedding) {
     embeddingAddressPlaceholder = t("separateEmbeddingAddress");
   } else if (generationUrl) {
     embeddingAddressPlaceholder = t("embeddingAddressPlaceholder");
   } else {
     embeddingAddressPlaceholder = t("embeddingAddressDefaultPlaceholder");
   }
-  const inheritsEmbeddingUrl = !embeddingUrl && savedProviderSpec.can_reuse_embedding_credentials;
+  const inheritsEmbeddingUrl = !embeddingUrl && canInheritEmbedding;
   const embeddingAddressChanged = embeddingUrl !== (cfg.embedding_base_url ?? "");
   const embeddingAddressStatus = t(
     embeddingAddressChanged ? "embeddingAddressAfterSave" : "embeddingAddressCurrent",
   );
   let embeddingAddressDescription: string;
-  if (embeddingUrl) {
+  if (isVlEmbedding) {
+    embeddingAddressDescription = t("embeddingVlEndpoint");
+  } else if (embeddingUrl) {
     embeddingAddressDescription = t("embeddingAddressIndependent", { status: embeddingAddressStatus, address: embeddingUrl });
   } else if (!inheritsEmbeddingUrl) {
     embeddingAddressDescription = t("embeddingAddressNativeDefault", { status: embeddingAddressStatus });
@@ -475,7 +487,7 @@ function BaseModelConfigForm() {
     embeddingKeyDescription = t("embeddingKeyNew");
   } else if (cfg.embedding_api_key_set) {
     embeddingKeyDescription = t("embeddingKeySaved");
-  } else if (savedProviderSpec.can_reuse_embedding_credentials && hasGenerationKey) {
+  } else if (canInheritEmbedding && hasGenerationKey) {
     embeddingKeyDescription = t("embeddingKeyInherited");
   } else {
     embeddingKeyDescription = t("embeddingKeyRequired");
@@ -743,7 +755,7 @@ function BaseModelConfigForm() {
         <SettingsRow
           title={t("modelAndConnection")}
           description={t(
-            savedProviderSpec.can_reuse_embedding_credentials
+            canInheritEmbedding
               ? "embeddingConnectionDescription"
               : "embeddingNativeConnectionDescription",
           )}
@@ -755,7 +767,12 @@ function BaseModelConfigForm() {
                 id="emb-model"
                 disabled={cfg.locked_fields.includes("embedding_model")}
                 value={embModel}
-                onChange={(event) => setEmbModel(event.target.value)}
+                onChange={(event) => {
+                  const nextModel = event.target.value;
+                  setEmbModel(nextModel);
+                  // 切到 VL 时立刻清空地址，避免残留上一模型（文本 embedding）的 OpenAI 兼容地址
+                  if (isVlEmbeddingModel(nextModel)) setEmbBaseUrl("");
+                }}
                 placeholder="Qwen/Qwen3-Embedding-4B"
               />
             </Field>
@@ -776,10 +793,10 @@ function BaseModelConfigForm() {
               <FieldLabel htmlFor="emb-url">{t("optionalBaseUrl")}</FieldLabel>
               <Input
                 id="emb-url"
-                disabled={cfg.locked_fields.includes("embedding_base_url")}
-                value={embBaseUrl}
+                disabled={isVlEmbedding || cfg.locked_fields.includes("embedding_base_url")}
+                value={isVlEmbedding ? "" : embBaseUrl}
                 onChange={(event) => setEmbBaseUrl(event.target.value)}
-                placeholder={embeddingAddressPlaceholder}
+                placeholder={isVlEmbedding ? "DashScope" : embeddingAddressPlaceholder}
                 aria-describedby={showInheritedAddressKeyNote
                   ? "emb-url-description emb-url-key-note" : "emb-url-description"}
               />
@@ -805,7 +822,7 @@ function BaseModelConfigForm() {
                 placeholder={
                   cfg.embedding_api_key_set
                     ? t("keyConfigured")
-                    : savedProviderSpec.can_reuse_embedding_credentials
+                    : canInheritEmbedding
                       ? t("reuseGeneration")
                       : t("separateEmbeddingKey")
                 }

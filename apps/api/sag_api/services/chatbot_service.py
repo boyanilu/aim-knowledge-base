@@ -20,7 +20,7 @@ from sag_api.core.chatbot_config import (
     error,
 )
 from sag_api.core.config import settings
-from sag_api.core.embedding_policy import with_embedding_batch_limit
+from sag_api.core.embedding_policy import is_multimodal_embedding_model, with_embedding_batch_limit
 from sag_api.core.errors import ConfigurationError, ForbiddenError, UpstreamError
 from sag_api.db.models import Setting
 
@@ -104,11 +104,11 @@ class Snapshot:
         if kind not in self.adapters:
             from zleap.sag.config import EmbeddingConfig, LLMConfig
             from zleap.sag.core.adapters.defaults import (
-                OpenAIEmbeddingAdapter,
                 OpenAILLMAdapter,
             )
 
             from sag_api.sag.config_builder import _structured_output_mode
+            from sag_api.sag.embedding_factory import create_embedding
 
             if kind == "llm":
                 settings = self.settings
@@ -126,16 +126,31 @@ class Snapshot:
                 self.adapters[kind] = OpenAILLMAdapter(config=config)
             else:
                 connection = self.connections["embedding"]
+                # VL 向量模型只有百炼原生多模态端点：查询连接不得改端点，否则查询与入库
+                # 会落到不同地址。Key 仍可覆盖；留空时复用主 Embedding 配置的 Key。
+                vl_embedding = is_multimodal_embedding_model(self.stock.embedding_model)
+                if vl_embedding:
+                    base_url = self.stock.effective_embedding_base_url
+                    inherited_key = self.stock.effective_embedding_api_key
+                    if not connection.api_key and not inherited_key:
+                        raise error(
+                            "Query embedding for Qwen3-VL requires an API key: "
+                            "set the main embedding key or a separate query key"
+                        )
+                    api_key = connection.api_key or inherited_key or KEYLESS_API_KEY
+                else:
+                    base_url = connection.base_url
+                    api_key = connection.api_key or KEYLESS_API_KEY
                 config = EmbeddingConfig(
                     model=self.stock.embedding_model,
-                    api_key=connection.api_key or KEYLESS_API_KEY,
-                    base_url=connection.base_url,
+                    api_key=api_key,
+                    base_url=base_url,
                     schema_dimensions=self.stock.effective_embedding_schema_dimensions,
                     request_dimensions=self.stock.effective_embedding_request_dimensions,
                     timeout=self.stock.embedding_timeout,
                 )
-                if connection.api_key:
-                    adapter = OpenAIEmbeddingAdapter(config=config)
+                if api_key != KEYLESS_API_KEY:
+                    adapter = create_embedding(config=config)
                 else:
                     adapter = KeylessEmbeddingAdapter(config)
                 self.adapters[kind] = with_embedding_batch_limit(adapter, config)
@@ -469,12 +484,14 @@ def install_query_adapters():
         return
     from zleap.sag.core.adapters import defaults, registry
 
+    from sag_api.sag.embedding_factory import create_embedding
+
     registry.register("llm", "openai", lambda **kwargs: ScopedAdapter(defaults.OpenAILLMAdapter(**kwargs), "llm"))
     registry.register(
         "embedding",
         "openai",
         lambda **kwargs: ScopedAdapter(
-            with_embedding_batch_limit(defaults.OpenAIEmbeddingAdapter(**kwargs), kwargs.get("config")), "embedding"
+            with_embedding_batch_limit(create_embedding(**kwargs), kwargs.get("config")), "embedding"
         ),
     )
     _adapters_installed = True
