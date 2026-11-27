@@ -1,0 +1,6 @@
+# Insert this bundle and retire the official brand package so only one brand occupies the slots.
+- insert:
+    - id: dsh-brand
+      name: '@aim-lab/dsh-brand'
+- id: ui-brand-official
+  disabled: true
