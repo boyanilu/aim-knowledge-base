@@ -155,7 +155,7 @@ Docker Compose 或 `.env` 中的 `SAG_LLM_*` 用于提供首次启动时的模�
 
 PDF 在 MinerU 配置完整时优先使用 MinerU；未配置或解析失败时自动回退本地 MarkItDown。其他 Office 和文本格式默认使用 MarkItDown。
 
-PDF 解析也支持自托管 MinerU 4.x V1 API（`mineru-kit api-server`）。参照 [`.env.example`](.env.example)，配置 `SAG_MINERU_PROVIDER=self_hosted`、`SAG_MINERU_BASE_URL`，并将 `SAG_DOCUMENT_PARSER` 设为 `auto` 或 `mineru`。本机或内网地址还需显式设置 `SAG_MINERU_ALLOW_PRIVATE_BASE_URL=true`。修改部署配置后重新创建 API 容器。此前在界面保存的解析器/MinerU 配置会覆盖环境默认值；请通过鉴权 `PUT /api/v1/system/model-config` 更新已保存的值，并在导入 PDF 前核对实际生效配置。
+PDF 解析也支持自托管 MinerU 4.2+ V1 Tasks API（`mineru-kit api-server`，部署与启动见 [`docs/mineru-setup.md`](docs/mineru-setup.md)）。参照 [`.env.example`](.env.example)，配置 `SAG_MINERU_PROVIDER=self_hosted`、`SAG_MINERU_BASE_URL`，并将 `SAG_DOCUMENT_PARSER` 设为 `auto` 或 `mineru`。本机或内网地址还需显式设置 `SAG_MINERU_ALLOW_PRIVATE_BASE_URL=true`。修改部署配置后重新创建 API 容器。此前在界面保存的解析器/MinerU 配置会覆盖环境默认值；请通过鉴权 `PUT /api/v1/system/model-config` 更新已保存的值，并在导入 PDF 前核对实际生效配置。
 
 也可以在设置页把解析方式切换为 **AnyDoc**（或设置 `SAG_DOCUMENT_PARSER=anydoc`）：docx/pptx/epub/pdf/csv 在本机由 [AnyDoc](https://github.com/firecrawl/anydoc) 转换，文件不上传、不调用托管 OCR；xls/xlsx 沿用本机 MarkItDown 转换，以保留引擎的 Excel 记录组和检索切片，并记录实际解析器。仅 AnyDoc 明确不支持的文件回退 MarkItDown，其他转换错误直接报告失败。CSV 先按 SAG 的编码识别规范成 UTF-8 再交给 AnyDoc，避免非 UTF-8 中文出现乱码。扫描版或图文混排 PDF 会被整体提示需要 OCR（保留页码），此时请用已配置的 MinerU 重新处理；该路径不缓存部分文本。`auto` 默认规则保持不变。
 

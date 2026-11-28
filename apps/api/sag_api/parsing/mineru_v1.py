@@ -1,10 +1,10 @@
-"""自部署 MinerU 4.x V1 HTTP API 适配器。
+"""自部署 MinerU 4.2+ V1 Tasks HTTP API 适配器。
 
-协议参照 MinerU 4.0 官方 `docs/usage/http_api.md` 与 `scripts/http_api_example.sh`：
-创建上传 → PUT 原始字节 → 完成上传 → 提交解析任务 → 轮询终态 → 经
-`/v1/files/{file_id}/content` 下载 zip 结果。自部署服务常位于本机或内网，
-因此只有显式开启 `mineru_allow_private_base_url` 时，才放行用户配置的 Base URL
-指向内网/loopback；结果下载与带鉴权的上传必须与 Base URL 同源。
+协议参照 MinerU 4.2 官方 `POST /v1/tasks` 异步任务规范：
+创建任务 → 按需 PUT 原始字节（服务端已缓存时跳过）→ 轮询 `GET /v1/tasks/{task_id}`
+→ 从完成文件的 `result_url` 下载 zip 结果。自部署服务常位于本机或内网，因此只有显式开启
+`mineru_allow_private_base_url` 时，才放行用户配置的 Base URL 指向内网/loopback；
+结果下载与带鉴权的上传必须与 Base URL 同源。
 """
 
 from __future__ import annotations
@@ -12,11 +12,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import mimetypes
 import os
 import time
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 
@@ -33,14 +32,14 @@ from sag_api.parsing.mineru_official import _file_chunks
 
 log = logging.getLogger(__name__)
 
-_PENDING_JOB_STATES = {"queued", "running"}
-_TERMINAL_JOB_STATES = {"completed", "partial", "failed", "canceled"}
-_JOB_STATES = _PENDING_JOB_STATES | _TERMINAL_JOB_STATES
-_RESUME_KEYS = ("file_id", "job_id")
+_PENDING_TASK_STATES = {"waiting-file", "pending", "running"}
+_TERMINAL_TASK_STATES = {"completed", "partial", "failed", "canceled"}
+_TASK_STATES = _PENDING_TASK_STATES | _TERMINAL_TASK_STATES
+_RESUME_KEYS = ("task_id", "file_id", "job_id")
 
 
 class _ResourceLost(Exception):
-    """服务重启后进程内的 upload/file/job 记录失效（V1 API 不持久化任务）。"""
+    """服务重启后进程内的 task/file 记录失效（V1 API 不持久化任务）。"""
 
 
 class SelfHostedMinerUClient(MinerU302Client):
@@ -97,81 +96,85 @@ class SelfHostedMinerUClient(MinerU302Client):
         on_state: StateCallback | None,
         should_pause: PauseCallback | None,
     ) -> MinerUResult:
-        job_id = current.get("job_id")
-        if not _non_empty(job_id):
-            file_id = current.get("file_id")
-            if not _non_empty(file_id):
-                file_id = await self._upload(path, current, on_state=on_state)
-            job_id = await self._create_job(str(file_id))
-            current["job_id"] = job_id
+        task_id = current.get("task_id")
+        uploaded = False
+        if not _non_empty(task_id):
+            task_id, file_id, task_status, upload = await self._create_task(path)
+            current.pop("job_id", None)
+            current["task_id"] = task_id
+            current["file_id"] = file_id
+            if task_status in _TASK_STATES:
+                current["status"] = task_status
             if on_state:
                 await on_state(dict(current))
-        result_file_id = await self._poll_job(
-            str(job_id), current, on_state=on_state, should_pause=should_pause
+            if upload is not None:
+                uploaded = await self._put_bytes(path, upload)
+        result_url = await self._poll_task(
+            str(task_id),
+            current,
+            path=path,
+            uploaded=uploaded,
+            on_state=on_state,
+            should_pause=should_pause,
         )
-        return await self._download_zip(result_file_id)
+        return await self._download_zip(result_url)
 
-    async def _upload(
-        self,
-        path: str,
-        current: dict[str, Any],
-        *,
-        on_state: StateCallback | None,
-    ) -> str:
+    async def _create_task(
+        self, path: str
+    ) -> tuple[str, str, str | None, dict[str, Any] | None]:
         try:
             size = os.path.getsize(path)
             digest = await asyncio.to_thread(_sha256_file, path)
         except OSError as exc:
             raise UpstreamError(f"无法读取待解析文件：{exc}") from exc
-        filename = os.path.basename(path)
-        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        payload = await self._v1_json(
-            "POST",
-            "uploads",
-            "创建上传",
-            json={
-                "filename": filename,
-                "bytes": size,
-                "mime_type": mime_type,
-                "purpose": "parse",
-                "sha256sum": digest,
-            },
-        )
-        upload_id = _required_string(payload, "id", "创建上传")
+        if size <= 0:
+            raise UpstreamError("待解析文件为空")
+        body: dict[str, Any] = {
+            "files": [
+                {
+                    "file_name": os.path.basename(path),
+                    "bytes": size,
+                    "sha256sum": digest,
+                }
+            ],
+            "ocr_mode": self._parse_method,
+            "output_formats": ["default"],
+        }
+        if self._tier:
+            body["tier"] = self._tier
+        payload = await self._v1_json("POST", "tasks", "提交解析任务", json=body)
+        task_id = _required_string(payload, "task_id", "提交解析任务")
+        entry = _first_file_entry(payload, "提交解析任务")
+        file_id = _required_string(entry, "file_id", "提交解析任务")
         status = payload.get("status")
-        if status == "pending":
-            await self._put_bytes(path, payload)
-            payload = await self._v1_json(
-                "POST",
-                f"uploads/{upload_id}/complete",
-                "完成上传",
-                json={"sha256sum": digest},
-            )
-            status = payload.get("status")
-        if status != "completed":
-            raise UpstreamError(f"MinerU 上传状态异常：{status or '空'}")
-        file_info = payload.get("file")
-        file_id = _required_string(file_info if isinstance(file_info, dict) else {}, "id", "上传")
-        current["file_id"] = file_id
-        if on_state:
-            await on_state(dict(current))
-        return file_id
+        task_status = str(status) if isinstance(status, str) and status in _TASK_STATES else None
+        upload = entry.get("upload")
+        if upload is not None and not isinstance(upload, dict):
+            raise UpstreamError("MinerU 创建任务响应中的 upload 字段无效")
+        log.info("MinerU 自部署服务已创建解析任务 task=%s", task_id)
+        return task_id, file_id, task_status, upload
 
-    async def _put_bytes(self, path: str, upload: dict[str, Any]) -> None:
-        upload_url = upload.get("upload_url")
-        method = upload.get("upload_method") or "PUT"
-        if not _non_empty(upload_url) or method != "PUT":
+    async def _put_bytes(self, path: str, upload: dict[str, Any]) -> bool:
+        upload_url = upload.get("url")
+        if not _non_empty(upload_url):
             raise UpstreamError("MinerU 上传响应缺少有效的 PUT 上传地址")
         target = urljoin(f"{self._api_root}/", str(upload_url))
-        headers = upload.get("upload_headers") or {}
+        headers = upload.get("headers") or {}
         if not isinstance(headers, dict) or not all(
             isinstance(key, str) and isinstance(value, str) for key, value in headers.items()
         ):
-            raise UpstreamError("MinerU 上传响应中的 upload_headers 无效")
+            raise UpstreamError("MinerU 上传响应中的 headers 无效")
         headers = dict(headers)
+        try:
+            size = os.path.getsize(path)
+        except OSError as exc:
+            raise UpstreamError(f"无法读取待解析文件：{exc}") from exc
+        if not any(key.lower() == "content-length" for key in headers):
+            headers["Content-Length"] = str(size)
         if _same_origin(target, self._api_root):
             await self._check_base_host()
-            headers.update(self._headers)
+            if self._api_key and not any(key.lower() == "authorization" for key in headers):
+                headers.update(self._headers)
         else:
             # 跨源上传（如对象存储签名地址）自带授权，不转发 MinerU Key，并沿用公网校验。
             parsed = _checked_http_url(target, "MinerU 返回了不安全的上传地址")
@@ -187,55 +190,65 @@ class SelfHostedMinerUClient(MinerU302Client):
             raise ServiceUnavailableError("上传文件到 MinerU 超时") from exc
         except httpx.RequestError as exc:
             raise ServiceUnavailableError(f"无法上传文件到 MinerU：{exc}") from exc
+        if response.status_code in {404, 410}:
+            raise _ResourceLost(mineru_core._error_message(response))
+        if response.status_code == 409:
+            log.warning(
+                "MinerU 上传返回 409，改为查询任务快照确认状态：%s",
+                mineru_core._error_message(response),
+            )
+            return True
         self._checked(response, "上传文件到 MinerU")
+        return True
 
-    async def _create_job(self, file_id: str) -> str:
-        body: dict[str, Any] = {
-            "files": [{"source": {"type": "file_id", "file_id": file_id}}],
-            "ocr_mode": self._parse_method,
-            "output_formats": ["zip"],
-        }
-        if self._tier:
-            body["tier"] = self._tier
-        payload = await self._v1_json(
-            "POST", "parse/jobs", "提交解析任务", json=body, lost_on_404=True
-        )
-        job_id = _required_string(payload, "job_id", "提交解析任务")
-        log.info("MinerU 自部署服务已创建解析任务 job=%s", job_id)
-        return job_id
-
-    async def _poll_job(
+    async def _poll_task(
         self,
-        job_id: str,
+        task_id: str,
         current: dict[str, Any],
         *,
+        path: str,
+        uploaded: bool,
         on_state: StateCallback | None,
         should_pause: PauseCallback | None,
     ) -> str:
         deadline = time.monotonic() + self._poll_timeout
         last_status: str | None = None
+        encoded_task_id = quote(task_id, safe="")
+        expected_file_id = current.get("file_id")
         while True:
             if should_pause is not None and await should_pause():
-                log.info("MinerU 轮询收到暂停信号，协作式中断 job=%s", job_id)
+                log.info("MinerU 轮询收到暂停信号，协作式中断 task=%s", task_id)
                 raise ParsePaused()
             payload = await self._v1_json(
-                "GET", f"parse/jobs/{job_id}", "查询解析任务", lost_on_404=True
+                "GET", f"tasks/{encoded_task_id}", "查询解析任务", lost_on_404=True
             )
             status = payload.get("status")
-            if status not in _JOB_STATES:
+            if status not in _TASK_STATES:
                 raise UpstreamError(f"MinerU 返回未知任务状态：{status or '空'}")
-            if status in _TERMINAL_JOB_STATES:
-                return _completed_zip_file_id(payload, str(status))
+            if status in _TERMINAL_TASK_STATES:
+                return _completed_result_url(
+                    payload,
+                    str(status),
+                    str(expected_file_id) if _non_empty(expected_file_id) else None,
+                )
+            if status == "waiting-file" and not uploaded:
+                entry = _select_file_entry(
+                    payload, str(expected_file_id) if _non_empty(expected_file_id) else None
+                )
+                upload = entry.get("upload") if entry else None
+                if isinstance(upload, dict):
+                    await self._put_bytes(path, upload)
+                    uploaded = True
             if status != last_status:
                 last_status = str(status)
                 if on_state is not None:
                     await on_state({**current, "status": last_status})
             if time.monotonic() >= deadline:
-                raise ServiceUnavailableError(f"MinerU 解析等待超时（任务 {job_id}）")
+                raise ServiceUnavailableError(f"MinerU 解析等待超时（任务 {task_id}）")
             await asyncio.sleep(self._poll_interval)
 
-    async def _download_zip(self, file_id: str) -> MinerUResult:
-        current_url = f"{self._api_root}/v1/files/{file_id}/content"
+    async def _download_zip(self, result_url: str) -> MinerUResult:
+        current_url = urljoin(f"{self._api_root}/", result_url)
         try:
             async with httpx.AsyncClient(timeout=self._request_timeout) as client:
                 for _ in range(6):
@@ -348,17 +361,40 @@ def _same_origin(url: str, base: str) -> bool:
         return False
 
 
-def _completed_zip_file_id(payload: dict[str, Any], status: str) -> str:
+def _first_file_entry(payload: dict[str, Any], action: str) -> dict[str, Any]:
     files = payload.get("files")
-    entry = files[0] if isinstance(files, list) and files and isinstance(files[0], dict) else {}
+    if isinstance(files, list) and files and isinstance(files[0], dict):
+        return files[0]
+    raise UpstreamError(f"MinerU {action}响应中没有文件条目")
+
+
+def _select_file_entry(
+    payload: dict[str, Any], expected_file_id: str | None = None
+) -> dict[str, Any]:
+    files = payload.get("files")
+    if not isinstance(files, list):
+        return {}
+    entries = [item for item in files if isinstance(item, dict)]
+    if expected_file_id:
+        for item in entries:
+            if item.get("file_id") == expected_file_id:
+                return item
+    return entries[0] if entries else {}
+
+
+def _completed_result_url(
+    payload: dict[str, Any], status: str, expected_file_id: str | None = None
+) -> str:
+    entry = _select_file_entry(payload, expected_file_id)
     if status == "completed" or (status == "partial" and entry.get("status") == "completed"):
-        outputs = entry.get("output_files")
-        zip_ref = outputs.get("zip") if isinstance(outputs, dict) else None
-        file_id = zip_ref.get("file_id") if isinstance(zip_ref, dict) else None
-        if not _non_empty(file_id):
-            raise UpstreamError("MinerU 任务已完成，但响应中没有 zip 结果")
-        return str(file_id)
-    message = mineru_core._find_error_message(entry.get("error") or {}) or "未知错误"
+        result_url = entry.get("result_url")
+        if not _non_empty(result_url):
+            raise UpstreamError("MinerU 任务已完成，但响应中没有结果下载地址")
+        return str(result_url).strip()
+    message = (
+        mineru_core._find_error_message(entry.get("error") or payload.get("error") or {})
+        or "未知错误"
+    )
     if status == "canceled":
         raise UpstreamError(f"MinerU 解析任务已取消：{message}")
     raise UpstreamError(f"MinerU 解析失败：{message}")

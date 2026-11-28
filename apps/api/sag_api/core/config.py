@@ -277,7 +277,7 @@ class Settings(BaseSettings):
     # auto：PDF 优先 MinerU，未配置或 MinerU 失败时回退本地 MarkItDown。
     # anydoc：本地 AnyDoc 转换（不做 OCR），仅其不支持的文件回退 MarkItDown。
     document_parser: Literal["auto", "markitdown", "mineru", "anydoc"] = "auto"
-    # self_hosted：自部署 MinerU 4.x V1 API（`mineru-kit api-server`），API Key 可留空。
+    # self_hosted：自部署 MinerU 4.2+ V1 Tasks API（`mineru-kit api-server`），API Key 可留空。
     mineru_provider: Literal["302", "official", "self_hosted"] = "302"
     mineru_base_url: str | None = "https://api.302ai.cn"
     mineru_api_key: str | None = None

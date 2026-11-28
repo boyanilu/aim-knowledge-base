@@ -1,6 +1,6 @@
-"""自部署 MinerU 4.x V1 API 适配：上传 → 提交任务 → 轮询 → 下载 zip。
+"""自部署 MinerU 4.2+ V1 Tasks API 适配：创建任务 → 按需 PUT 上传 → 轮询 → 下载 zip。
 
-模拟响应按 MinerU 4.0.10 `mineru-kit api-server` 的真实返回结构编写。
+模拟响应按 MinerU 4.2.3 `mineru-kit api-server` 的 Tasks 协议真实返回结构编写。
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import pytest
 
 from sag_api.core.config import Settings
 from sag_api.core.errors import ConfigurationError, ServiceUnavailableError, UpstreamError
+from sag_api.jobs.tasks import _parser_state_values
 from sag_api.parsing import service
 from sag_api.parsing.mineru import MinerUClient, ParsePaused, _markdown_from_zip
 from sag_api.parsing.mineru_v1 import SelfHostedMinerUClient
@@ -52,56 +53,74 @@ def _v1_zip(markdown: str) -> bytes:
     return target.getvalue()
 
 
-def _job(job_id: str, status: str, file_status: str, **file_fields: Any) -> dict[str, Any]:
+def _task(
+    task_id: str,
+    status: str,
+    file_status: str,
+    *,
+    file_id: str = "file-src",
+    **file_fields: Any,
+) -> dict[str, Any]:
     return {
-        "job_id": job_id,
+        "task_id": task_id,
         "status": status,
         "created_at": "2026-10-02T08:03:31Z",
         "started_at": None,
         "finished_at": None,
-        "tier": "flash",
-        "output_formats": ["zip"],
-        "access_level": "registered",
+        "output_formats": ["default"],
         "progress": {"completed": 0, "failed": 0, "total": 1},
         "files": [
             {
-                "file_id": "file-src",
-                "name": "paper.pdf",
-                "page_range": "",
+                "file_id": file_id,
+                "file_name": "paper.pdf",
                 "status": file_status,
+                "bytes": 20,
+                "url": None,
+                "upload": None,
                 "parse": None,
-                "output_files": None,
+                "result_url": None,
                 "error": None,
                 **file_fields,
             }
         ],
-        "links": {"self": f"/v1/parse/jobs/{job_id}", "cancel": f"/v1/parse/jobs/{job_id}"},
+        "error": None,
     }
 
 
-def _completed_job(job_id: str = "job_1") -> dict[str, Any]:
-    outputs = {
-        "markdown": None,
-        "middle_json": None,
-        "structured_content": None,
-        "html": None,
-        "latex": None,
-        "docx": None,
-        "zip": {"file_id": "file-zip", "bytes": 100},
-    }
-    return _job(job_id, "completed", "completed", output_files=outputs)
+def _completed_task(
+    task_id: str = "task_1",
+    *,
+    base: str = BASE,
+    file_id: str = "file-src",
+    result_url: str | None = None,
+) -> dict[str, Any]:
+    return _task(
+        task_id,
+        "completed",
+        "completed",
+        file_id=file_id,
+        parse={"tier": "flash", "duration_ms": 120, "parser_version": "4.2.3"},
+        result_url=result_url or f"{base}/v1/files/{file_id}/content",
+    )
 
 
 class FakeV1Server:
-    """有状态的 V1 服务模拟；按需替换某一步的响应。"""
+    """有状态的 MinerU 4.2 Tasks V1 服务模拟；按需替换某一步的响应。"""
 
     def __init__(self, base: str = BASE, *, markdown: str = "# Self hosted result") -> None:
         self.base = base
         self.markdown = markdown
         self.requests: list[httpx.Request] = []
         self.upload_url: str | None = None
-        self.polls: list[dict[str, Any]] = [_job("job_1", "running", "running"), _completed_job()]
+        self.polls: list[dict[str, Any]] | None = None
         self.overrides: dict[tuple[str, str], Any] = {}
+
+    def _default_polls(self) -> list[dict[str, Any]]:
+        return [
+            _task("task_1", "pending", "pending"),
+            _task("task_1", "running", "running"),
+            _completed_task(base=self.base),
+        ]
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -109,40 +128,46 @@ class FakeV1Server:
         if key in self.overrides:
             override = self.overrides[key]
             return override(request) if callable(override) else override
-        if key == ("POST", "/v1/uploads"):
+        if key == ("POST", "/v1/tasks"):
             return httpx.Response(
                 200,
                 json={
-                    "id": "upload_1",
-                    "object": "upload",
-                    "status": "pending",
-                    "upload_url": self.upload_url or f"{self.base}/v1/uploads/upload_1/content",
-                    "upload_method": "PUT",
-                    "upload_headers": {"Content-Type": "application/pdf"},
-                    "file": None,
+                    "task_id": "task_1",
+                    "status": "waiting-file",
+                    "files": [
+                        {
+                            "file_id": "file-src",
+                            "file_name": "paper.pdf",
+                            "status": "waiting-file",
+                            "upload": {
+                                "url": self.upload_url
+                                or f"{self.base}/v1/tasks/task_1/files/file-src/upload",
+                                "headers": {"Content-Type": "application/octet-stream"},
+                                "expires_at": 1791000000,
+                            },
+                        }
+                    ],
                 },
             )
         if request.method == "PUT":
-            return httpx.Response(200)
-        if key == ("POST", "/v1/uploads/upload_1/complete"):
             return httpx.Response(
                 200,
-                json={"id": "upload_1", "status": "completed", "file": {"id": "file-src"}},
+                json={"task_id": "task_1", "file_id": "file-src", "status": "pending"},
             )
-        if key == ("POST", "/v1/parse/jobs"):
-            return httpx.Response(202, json=_job("job_1", "queued", "queued"))
-        if key == ("GET", "/v1/parse/jobs/job_1"):
+        if key == ("GET", "/v1/tasks/task_1"):
+            if self.polls is None:
+                self.polls = self._default_polls()
             payload = self.polls.pop(0) if len(self.polls) > 1 else self.polls[0]
             return httpx.Response(200, json=payload)
-        if key == ("GET", "/v1/files/file-zip/content"):
+        if key == ("GET", "/v1/files/file-src/content"):
             return httpx.Response(
                 200,
                 content=_v1_zip(self.markdown),
-                headers={"content-type": "application/octet-stream"},
+                headers={"content-type": "application/zip"},
             )
         return httpx.Response(
             404,
-            json={"error": {"type": "invalid_request_error", "code": "not_found", "message": "missing"}},
+            json={"error": {"code": "not_found", "message": "missing", "param": None}},
         )
 
     def calls(self) -> list[tuple[str, str]]:
@@ -186,48 +211,61 @@ async def test_self_hosted_v1_full_flow(v1_server, pdf):
 
     assert markdown == "# Self hosted result\n"
     assert v1_server.calls() == [
-        ("POST", f"{BASE}/v1/uploads"),
-        ("PUT", f"{BASE}/v1/uploads/upload_1/content"),
-        ("POST", f"{BASE}/v1/uploads/upload_1/complete"),
-        ("POST", f"{BASE}/v1/parse/jobs"),
-        ("GET", f"{BASE}/v1/parse/jobs/job_1"),
-        ("GET", f"{BASE}/v1/parse/jobs/job_1"),
-        ("GET", f"{BASE}/v1/files/file-zip/content"),
+        ("POST", f"{BASE}/v1/tasks"),
+        ("PUT", f"{BASE}/v1/tasks/task_1/files/file-src/upload"),
+        ("GET", f"{BASE}/v1/tasks/task_1"),
+        ("GET", f"{BASE}/v1/tasks/task_1"),
+        ("GET", f"{BASE}/v1/tasks/task_1"),
+        ("GET", f"{BASE}/v1/files/file-src/content"),
     ]
     assert all(r.headers["authorization"] == f"Bearer {API_KEY}" for r in v1_server.requests)
-    create_upload = json.loads(v1_server.requests[0].content)
-    assert create_upload["filename"] == "paper.pdf"
-    assert create_upload["bytes"] == pdf.stat().st_size
-    assert create_upload["mime_type"] == "application/pdf"
-    assert create_upload["purpose"] == "parse"
-    assert len(create_upload["sha256sum"]) == 64
-    assert v1_server.requests[1].headers["content-type"] == "application/pdf"
-    assert v1_server.requests[1].read() == pdf.read_bytes()
-    assert json.loads(v1_server.requests[3].content) == {
-        "files": [{"source": {"type": "file_id", "file_id": "file-src"}}],
-        "ocr_mode": "auto",
-        "output_formats": ["zip"],
-        "tier": "flash",
-    }
+    create_task = json.loads(v1_server.requests[0].content)
+    assert create_task["ocr_mode"] == "auto"
+    assert create_task["output_formats"] == ["default"]
+    assert create_task["tier"] == "flash"
+    assert len(create_task["files"]) == 1
+    assert create_task["files"][0]["file_name"] == "paper.pdf"
+    assert create_task["files"][0]["bytes"] == pdf.stat().st_size
+    assert len(create_task["files"][0]["sha256sum"]) == 64
+
+    put = v1_server.requests[1]
+    assert put.headers["content-type"] == "application/octet-stream"
+    assert put.headers["content-length"] == str(pdf.stat().st_size)
+    assert put.read() == pdf.read_bytes()
+
     assert states[-1]["status"] == "done"
     assert states[-1]["mineru_service"] == "self_hosted"
+    assert states[-1]["task_id"] == "task_1"
     assert states[-1]["file_id"] == "file-src"
-    assert states[-1]["job_id"] == "job_1"
+    assert any(state.get("status") == "pending" for state in states)
     assert any(state.get("status") == "running" for state in states)
 
 
 @pytest.mark.asyncio
 async def test_self_hosted_deduplicated_upload_skips_byte_upload(v1_server, pdf):
-    v1_server.overrides[("POST", "/v1/uploads")] = httpx.Response(
-        200, json={"id": "upload_1", "status": "completed", "file": {"id": "file-src"}}
+    v1_server.overrides[("POST", "/v1/tasks")] = httpx.Response(
+        200,
+        json={
+            "task_id": "task_1",
+            "status": "pending",
+            "files": [
+                {
+                    "file_id": "file-src",
+                    "file_name": "paper.pdf",
+                    "status": "pending",
+                    "upload": None,
+                }
+            ],
+        },
     )
 
     markdown = await MinerUClient(_settings(mineru_tier=None, mineru_api_key=None)).parse(str(pdf))
 
     assert markdown == "# Self hosted result\n"
-    assert [call[0] for call in v1_server.calls()][:2] == ["POST", "POST"]
+    assert all(r.method != "PUT" for r in v1_server.requests)
+    assert [r.method for r in v1_server.requests[:2]] == ["POST", "GET"]
     assert all("authorization" not in r.headers for r in v1_server.requests)
-    assert "tier" not in json.loads(v1_server.requests[1].content)
+    assert "tier" not in json.loads(v1_server.requests[0].content)
 
 
 @pytest.mark.asyncio
@@ -265,7 +303,7 @@ async def test_public_base_url_works_without_private_switch(v1_server, pdf):
 
 @pytest.mark.asyncio
 async def test_result_redirect_must_stay_same_origin(v1_server, pdf):
-    v1_server.overrides[("GET", "/v1/files/file-zip/content")] = httpx.Response(
+    v1_server.overrides[("GET", "/v1/files/file-src/content")] = httpx.Response(
         302, headers={"location": "http://127.0.0.1:9999/leak.zip"}
     )
 
@@ -278,7 +316,7 @@ async def test_result_redirect_must_stay_same_origin(v1_server, pdf):
 @pytest.mark.asyncio
 async def test_same_origin_result_redirect_is_followed(v1_server, pdf):
     zip_response = httpx.Response(200, content=_v1_zip("# Redirected"))
-    v1_server.overrides[("GET", "/v1/files/file-zip/content")] = httpx.Response(
+    v1_server.overrides[("GET", "/v1/files/file-src/content")] = httpx.Response(
         302, headers={"location": "/v1/blobs/zip"}
     )
     v1_server.overrides[("GET", "/v1/blobs/zip")] = zip_response
@@ -297,6 +335,7 @@ async def test_cross_origin_upload_omits_key_and_keeps_ssrf_check(v1_server, pdf
     assert "authorization" not in put.headers
 
     v1_server.requests.clear()
+    v1_server.polls = None
     v1_server.upload_url = "http://10.0.0.5:9000/bucket/object"
     with pytest.raises(UpstreamError, match="内网"):
         await MinerUClient(_settings()).parse(str(pdf))
@@ -305,48 +344,48 @@ async def test_cross_origin_upload_omits_key_and_keeps_ssrf_check(v1_server, pdf
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("job", "message"),
+    ("task", "message"),
     [
         (
-            _job(
-                "job_1",
+            _task(
+                "task_1",
                 "failed",
                 "failed",
-                error={"type": "engine_error", "code": "parse_failed", "message": "bad pdf", "param": None},
+                error={"code": "parse_failed", "message": "bad pdf", "param": None},
             ),
             "MinerU 解析失败：bad pdf",
         ),
-        (_job("job_1", "canceled", "queued"), "已取消"),
+        (_task("task_1", "canceled", "canceled"), "已取消"),
         (
-            _job(
-                "job_1",
+            _task(
+                "task_1",
                 "partial",
                 "failed",
-                error={"type": "engine_error", "code": "parse_failed", "message": "page 2", "param": None},
+                error={"code": "parse_failed", "message": "page 2", "param": None},
             ),
             "page 2",
         ),
-        (_job("job_1", "completed", "completed"), "没有 zip"),
-        ({**_job("job_1", "running", "running"), "status": "weird"}, "未知任务状态"),
+        (_task("task_1", "completed", "completed"), "没有结果下载地址"),
+        ({**_task("task_1", "running", "running"), "status": "weird"}, "未知任务状态"),
     ],
 )
-async def test_terminal_failures_raise_upstream_error(v1_server, pdf, job, message):
-    v1_server.polls = [job]
+async def test_terminal_failures_raise_upstream_error(v1_server, pdf, task, message):
+    v1_server.polls = [task]
     with pytest.raises(UpstreamError, match=message):
         await MinerUClient(_settings()).parse(str(pdf))
 
 
 @pytest.mark.asyncio
-async def test_poll_timeout_keeps_job_for_resume(v1_server, pdf):
-    v1_server.polls = [_job("job_1", "running", "running")]
+async def test_poll_timeout_keeps_task_for_resume(v1_server, pdf):
+    v1_server.polls = [_task("task_1", "running", "running")]
     states: list[dict[str, Any]] = []
 
-    with pytest.raises(ServiceUnavailableError, match="job_1"):
+    with pytest.raises(ServiceUnavailableError, match="task_1"):
         await MinerUClient(_settings(mineru_poll_timeout=0.001)).parse(
             str(pdf), on_state=lambda state: _collect(states, state)
         )
 
-    assert states[-1]["job_id"] == "job_1"
+    assert states[-1]["task_id"] == "task_1"
 
 
 @pytest.mark.asyncio
@@ -354,38 +393,41 @@ async def test_request_timeout_and_auth_errors_are_mapped(v1_server, pdf):
     def timeout(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("slow", request=request)
 
-    v1_server.overrides[("POST", "/v1/uploads")] = timeout
+    v1_server.overrides[("POST", "/v1/tasks")] = timeout
     with pytest.raises(ServiceUnavailableError, match="超时"):
         await MinerUClient(_settings()).parse(str(pdf))
 
-    v1_server.overrides[("POST", "/v1/uploads")] = httpx.Response(
-        401, json={"error": {"type": "authentication_error", "message": "bad key"}}
+    v1_server.overrides[("POST", "/v1/tasks")] = httpx.Response(
+        401, json={"error": {"code": "unauthorized", "message": "bad key"}}
     )
     with pytest.raises(ConfigurationError, match="API Key"):
         await MinerUClient(_settings()).parse(str(pdf))
 
 
 @pytest.mark.asyncio
-async def test_resume_polls_saved_job_and_resubmits_after_service_restart(v1_server, pdf):
-    v1_server.polls = [_completed_job()]
+async def test_resume_polls_saved_task_and_resubmits_after_service_restart(v1_server, pdf):
+    v1_server.polls = [_completed_task()]
     markdown = await MinerUClient(_settings()).parse(
-        str(pdf), state={"file_id": "file-src", "job_id": "job_1"}
+        str(pdf), state={"file_id": "file-src", "task_id": "task_1"}
     )
     assert markdown == "# Self hosted result\n"
     assert [r.url.path for r in v1_server.requests] == [
-        "/v1/parse/jobs/job_1",
-        "/v1/files/file-zip/content",
+        "/v1/tasks/task_1",
+        "/v1/files/file-src/content",
     ]
 
     v1_server.requests.clear()
-    v1_server.polls = [_completed_job()]
+    v1_server.polls = [_completed_task()]
     markdown = await MinerUClient(_settings()).parse(
-        str(pdf), state={"file_id": "file-old", "job_id": "job_lost"}
+        str(pdf), state={"file_id": "file-old", "task_id": "task_lost"}
     )
     assert markdown == "# Self hosted result\n"
     paths = [r.url.path for r in v1_server.requests]
-    assert paths[0] == "/v1/parse/jobs/job_lost"
-    assert paths[1:4] == ["/v1/uploads", "/v1/uploads/upload_1/content", "/v1/uploads/upload_1/complete"]
+    assert paths[:3] == [
+        "/v1/tasks/task_lost",
+        "/v1/tasks",
+        "/v1/tasks/task_1/files/file-src/upload",
+    ]
 
 
 @pytest.mark.asyncio
@@ -398,8 +440,8 @@ async def test_pause_interrupts_polling(v1_server, pdf):
         await MinerUClient(_settings()).parse(
             str(pdf), on_state=lambda state: _collect(states, state), should_pause=pause
         )
-    assert states[-1]["job_id"] == "job_1"
-    assert all(r.url.path != "/v1/parse/jobs/job_1" for r in v1_server.requests)
+    assert states[-1]["task_id"] == "task_1"
+    assert all(r.url.path != "/v1/tasks/task_1" for r in v1_server.requests)
 
 
 @pytest.mark.asyncio
@@ -473,7 +515,7 @@ async def test_self_hosted_v1_parse_result_keeps_zip_sidecars(v1_server, pdf):
         }))
         target.writestr("structured_content.json", "{}")
         target.writestr("images/page_0_image_1.jpg", b"jpeg-bytes")
-    v1_server.overrides[("GET", "/v1/files/file-zip/content")] = httpx.Response(
+    v1_server.overrides[("GET", "/v1/files/file-src/content")] = httpx.Response(
         200, content=archive.getvalue(), headers={"content-type": "application/zip"}
     )
 
@@ -484,3 +526,123 @@ async def test_self_hosted_v1_parse_result_keeps_zip_sidecars(v1_server, pdf):
     assert json.loads(result.files["headings.json"]) == [
         {"title": "Method", "level": 2, "page_idx": 2}
     ]
+
+
+@pytest.mark.asyncio
+async def test_put_failure_persists_task_id_before_upload_and_resumes_without_duplicate_task(
+    v1_server, pdf
+):
+    def timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("upload slow", request=request)
+
+    v1_server.overrides[("PUT", "/v1/tasks/task_1/files/file-src/upload")] = timeout
+    states: list[dict[str, Any]] = []
+
+    with pytest.raises(ServiceUnavailableError, match="上传文件到 MinerU 超时"):
+        await MinerUClient(_settings()).parse(
+            str(pdf), on_state=lambda state: _collect(states, state)
+        )
+
+    assert states[-1]["task_id"] == "task_1"
+    assert states[-1]["file_id"] == "file-src"
+    assert states[-1]["status"] == "waiting-file"
+
+    # 恢复时复用已保存的 task_id/file_id，不重复 POST /v1/tasks，从快照拿到 upload 后补传完成。
+    v1_server.overrides.pop(("PUT", "/v1/tasks/task_1/files/file-src/upload"))
+    v1_server.requests.clear()
+    v1_server.polls = [
+        _task(
+            "task_1",
+            "waiting-file",
+            "waiting-file",
+            upload={
+                "url": f"{BASE}/v1/tasks/task_1/files/file-src/upload",
+                "headers": {"Content-Type": "application/octet-stream"},
+                "expires_at": 1791000000,
+            },
+        ),
+        _completed_task(),
+    ]
+
+    markdown = await MinerUClient(_settings()).parse(str(pdf), state=states[-1])
+
+    assert markdown == "# Self hosted result\n"
+    assert v1_server.calls() == [
+        ("GET", f"{BASE}/v1/tasks/task_1"),
+        ("PUT", f"{BASE}/v1/tasks/task_1/files/file-src/upload"),
+        ("GET", f"{BASE}/v1/tasks/task_1"),
+        ("GET", f"{BASE}/v1/files/file-src/content"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [404, 410])
+async def test_put_404_and_410_trigger_bounded_rebuild(v1_server, pdf, status_code):
+    put_attempts = 0
+
+    def fail_once(request: httpx.Request) -> httpx.Response:
+        nonlocal put_attempts
+        put_attempts += 1
+        if put_attempts == 1:
+            return httpx.Response(
+                status_code,
+                json={"error": {"code": "upload_expired", "message": "upload window gone"}},
+            )
+        return httpx.Response(
+            200,
+            json={"task_id": "task_1", "file_id": "file-src", "status": "pending"},
+        )
+
+    v1_server.overrides[("PUT", "/v1/tasks/task_1/files/file-src/upload")] = fail_once
+    markdown = await MinerUClient(_settings()).parse(str(pdf))
+    assert markdown == "# Self hosted result\n"
+    assert sum(1 for r in v1_server.requests if r.method == "POST" and r.url.path == "/v1/tasks") == 2
+    assert put_attempts == 2
+
+    # 连续两次 404/410 须有界停止，不能无限重建。
+    v1_server.requests.clear()
+    v1_server.polls = None
+    v1_server.overrides[("PUT", "/v1/tasks/task_1/files/file-src/upload")] = httpx.Response(
+        status_code,
+        json={"error": {"code": "upload_expired", "message": "upload window gone"}},
+    )
+    with pytest.raises(UpstreamError, match="找不到任务资源"):
+        await MinerUClient(_settings()).parse(str(pdf))
+    assert sum(1 for r in v1_server.requests if r.method == "POST" and r.url.path == "/v1/tasks") == 2
+
+
+@pytest.mark.asyncio
+async def test_put_409_requeries_task_snapshot_before_failing(v1_server, pdf):
+    v1_server.overrides[("PUT", "/v1/tasks/task_1/files/file-src/upload")] = httpx.Response(
+        409,
+        json={"error": {"code": "file_already_terminal", "message": "already uploaded"}},
+    )
+    v1_server.polls = [_completed_task()]
+
+    markdown = await MinerUClient(_settings()).parse(str(pdf))
+    assert markdown == "# Self hosted result\n"
+    assert [r.method for r in v1_server.requests] == ["POST", "PUT", "GET", "GET"]
+
+    # 若 409 后快照显示任务已取消，则按终态报错而不是回退重传。
+    v1_server.requests.clear()
+    v1_server.polls = [_task("task_1", "canceled", "canceled")]
+    with pytest.raises(UpstreamError, match="已取消"):
+        await MinerUClient(_settings()).parse(str(pdf))
+    assert [r.method for r in v1_server.requests] == ["POST", "PUT", "GET"]
+
+
+def test_waiting_file_maps_to_uploading_externally_while_preserving_raw_state():
+    raw_state = {
+        "provider": "mineru",
+        "mineru_service": "self_hosted",
+        "mineru_tier": "standard",
+        "task_id": "task_1",
+        "file_id": "file-src",
+        "status": "waiting-file",
+    }
+    values = _parser_state_values(raw_state)
+    assert values["parser_provider"] == "mineru"
+    assert values["mineru_provider"] == "self_hosted"
+    assert values["mineru_model"] == "standard"
+    assert values["parser_status"] == "uploading"
+    assert raw_state["status"] == "waiting-file"
