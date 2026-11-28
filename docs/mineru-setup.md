@@ -51,3 +51,24 @@ $env:MINERU_MODEL_VLM_ENGINE = "llama-cpp"
 ```
 
 这条命令启动 MinerU HTTP 服务，支持 `flash`、`basic` 和 `standard`。需要开放 `advanced` 时，将 `--tier standard` 改为 `--tier advanced`。
+
+## 5. 接入 SAG 后端
+
+在 `apps/api/.env`（或根 `.env`）中配置自部署 MinerU 4.2+ Tasks API：
+
+```dotenv
+SAG_DOCUMENT_PARSER=mineru
+SAG_MINERU_PROVIDER=self_hosted
+SAG_MINERU_BASE_URL=http://127.0.0.1:8001
+SAG_MINERU_ALLOW_PRIVATE_BASE_URL=true
+# 可选：指定解析档位（flash/basic/standard/advanced），留空使用服务端默认
+# SAG_MINERU_TIER=standard
+# 可选：若启动 api-server 时配置了 --api-key，则在此填入同一 Key
+# SAG_MINERU_API_KEY=
+```
+
+> **Docker 部署下的 `127.0.0.1` 可达性说明**：
+> - 若 SAG API 与 MinerU 同在宿主机直接运行，使用 `http://127.0.0.1:8001` 即可。
+> - 若 SAG API 运行在 Docker 容器内而 MinerU 运行在宿主机上，容器内的 `127.0.0.1` 指向容器自身而非宿主机，无法访问宿主机服务。此时请将 MinerU 启动地址改为 `--host 0.0.0.0`（或宿主机局域网 IP），并在 SAG 配置中使用 `SAG_MINERU_BASE_URL=http://host.docker.internal:8001`（或宿主机局域网地址），同时保持 `SAG_MINERU_ALLOW_PRIVATE_BASE_URL=true`。Linux Docker 如未默认解析 `host.docker.internal`，需在 compose 中为 API 服务添加 `extra_hosts: ["host.docker.internal:host-gateway"]`。
+> - 若应用设置页此前保存过解析器配置，需同步更新已保存的值并在导入 PDF 前核对生效配置。
+

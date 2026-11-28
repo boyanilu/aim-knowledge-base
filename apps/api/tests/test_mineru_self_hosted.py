@@ -15,6 +15,7 @@ import pytest
 
 from sag_api.core.config import Settings
 from sag_api.core.errors import ConfigurationError, ServiceUnavailableError, UpstreamError
+from sag_api.jobs.tasks import _parser_state_values
 from sag_api.parsing import service
 from sag_api.parsing.mineru import MinerUClient, ParsePaused, _markdown_from_zip
 from sag_api.parsing.mineru_v1 import SelfHostedMinerUClient
@@ -525,3 +526,123 @@ async def test_self_hosted_v1_parse_result_keeps_zip_sidecars(v1_server, pdf):
     assert json.loads(result.files["headings.json"]) == [
         {"title": "Method", "level": 2, "page_idx": 2}
     ]
+
+
+@pytest.mark.asyncio
+async def test_put_failure_persists_task_id_before_upload_and_resumes_without_duplicate_task(
+    v1_server, pdf
+):
+    def timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("upload slow", request=request)
+
+    v1_server.overrides[("PUT", "/v1/tasks/task_1/files/file-src/upload")] = timeout
+    states: list[dict[str, Any]] = []
+
+    with pytest.raises(ServiceUnavailableError, match="上传文件到 MinerU 超时"):
+        await MinerUClient(_settings()).parse(
+            str(pdf), on_state=lambda state: _collect(states, state)
+        )
+
+    assert states[-1]["task_id"] == "task_1"
+    assert states[-1]["file_id"] == "file-src"
+    assert states[-1]["status"] == "waiting-file"
+
+    # 恢复时复用已保存的 task_id/file_id，不重复 POST /v1/tasks，从快照拿到 upload 后补传完成。
+    v1_server.overrides.pop(("PUT", "/v1/tasks/task_1/files/file-src/upload"))
+    v1_server.requests.clear()
+    v1_server.polls = [
+        _task(
+            "task_1",
+            "waiting-file",
+            "waiting-file",
+            upload={
+                "url": f"{BASE}/v1/tasks/task_1/files/file-src/upload",
+                "headers": {"Content-Type": "application/octet-stream"},
+                "expires_at": 1791000000,
+            },
+        ),
+        _completed_task(),
+    ]
+
+    markdown = await MinerUClient(_settings()).parse(str(pdf), state=states[-1])
+
+    assert markdown == "# Self hosted result\n"
+    assert v1_server.calls() == [
+        ("GET", f"{BASE}/v1/tasks/task_1"),
+        ("PUT", f"{BASE}/v1/tasks/task_1/files/file-src/upload"),
+        ("GET", f"{BASE}/v1/tasks/task_1"),
+        ("GET", f"{BASE}/v1/files/file-src/content"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [404, 410])
+async def test_put_404_and_410_trigger_bounded_rebuild(v1_server, pdf, status_code):
+    put_attempts = 0
+
+    def fail_once(request: httpx.Request) -> httpx.Response:
+        nonlocal put_attempts
+        put_attempts += 1
+        if put_attempts == 1:
+            return httpx.Response(
+                status_code,
+                json={"error": {"code": "upload_expired", "message": "upload window gone"}},
+            )
+        return httpx.Response(
+            200,
+            json={"task_id": "task_1", "file_id": "file-src", "status": "pending"},
+        )
+
+    v1_server.overrides[("PUT", "/v1/tasks/task_1/files/file-src/upload")] = fail_once
+    markdown = await MinerUClient(_settings()).parse(str(pdf))
+    assert markdown == "# Self hosted result\n"
+    assert sum(1 for r in v1_server.requests if r.method == "POST" and r.url.path == "/v1/tasks") == 2
+    assert put_attempts == 2
+
+    # 连续两次 404/410 须有界停止，不能无限重建。
+    v1_server.requests.clear()
+    v1_server.polls = None
+    v1_server.overrides[("PUT", "/v1/tasks/task_1/files/file-src/upload")] = httpx.Response(
+        status_code,
+        json={"error": {"code": "upload_expired", "message": "upload window gone"}},
+    )
+    with pytest.raises(UpstreamError, match="找不到任务资源"):
+        await MinerUClient(_settings()).parse(str(pdf))
+    assert sum(1 for r in v1_server.requests if r.method == "POST" and r.url.path == "/v1/tasks") == 2
+
+
+@pytest.mark.asyncio
+async def test_put_409_requeries_task_snapshot_before_failing(v1_server, pdf):
+    v1_server.overrides[("PUT", "/v1/tasks/task_1/files/file-src/upload")] = httpx.Response(
+        409,
+        json={"error": {"code": "file_already_terminal", "message": "already uploaded"}},
+    )
+    v1_server.polls = [_completed_task()]
+
+    markdown = await MinerUClient(_settings()).parse(str(pdf))
+    assert markdown == "# Self hosted result\n"
+    assert [r.method for r in v1_server.requests] == ["POST", "PUT", "GET", "GET"]
+
+    # 若 409 后快照显示任务已取消，则按终态报错而不是回退重传。
+    v1_server.requests.clear()
+    v1_server.polls = [_task("task_1", "canceled", "canceled")]
+    with pytest.raises(UpstreamError, match="已取消"):
+        await MinerUClient(_settings()).parse(str(pdf))
+    assert [r.method for r in v1_server.requests] == ["POST", "PUT", "GET"]
+
+
+def test_waiting_file_maps_to_uploading_externally_while_preserving_raw_state():
+    raw_state = {
+        "provider": "mineru",
+        "mineru_service": "self_hosted",
+        "mineru_tier": "standard",
+        "task_id": "task_1",
+        "file_id": "file-src",
+        "status": "waiting-file",
+    }
+    values = _parser_state_values(raw_state)
+    assert values["parser_provider"] == "mineru"
+    assert values["mineru_provider"] == "self_hosted"
+    assert values["mineru_model"] == "standard"
+    assert values["parser_status"] == "uploading"
+    assert raw_state["status"] == "waiting-file"

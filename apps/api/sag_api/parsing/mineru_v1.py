@@ -99,15 +99,16 @@ class SelfHostedMinerUClient(MinerU302Client):
         task_id = current.get("task_id")
         uploaded = False
         if not _non_empty(task_id):
-            task_id, file_id, upload = await self._create_task(path)
-            if upload is not None:
-                await self._put_bytes(path, upload)
-                uploaded = True
+            task_id, file_id, task_status, upload = await self._create_task(path)
             current.pop("job_id", None)
             current["task_id"] = task_id
             current["file_id"] = file_id
+            if task_status in _TASK_STATES:
+                current["status"] = task_status
             if on_state:
                 await on_state(dict(current))
+            if upload is not None:
+                uploaded = await self._put_bytes(path, upload)
         result_url = await self._poll_task(
             str(task_id),
             current,
@@ -118,7 +119,9 @@ class SelfHostedMinerUClient(MinerU302Client):
         )
         return await self._download_zip(result_url)
 
-    async def _create_task(self, path: str) -> tuple[str, str, dict[str, Any] | None]:
+    async def _create_task(
+        self, path: str
+    ) -> tuple[str, str, str | None, dict[str, Any] | None]:
         try:
             size = os.path.getsize(path)
             digest = await asyncio.to_thread(_sha256_file, path)
@@ -143,13 +146,15 @@ class SelfHostedMinerUClient(MinerU302Client):
         task_id = _required_string(payload, "task_id", "提交解析任务")
         entry = _first_file_entry(payload, "提交解析任务")
         file_id = _required_string(entry, "file_id", "提交解析任务")
+        status = payload.get("status")
+        task_status = str(status) if isinstance(status, str) and status in _TASK_STATES else None
         upload = entry.get("upload")
         if upload is not None and not isinstance(upload, dict):
             raise UpstreamError("MinerU 创建任务响应中的 upload 字段无效")
         log.info("MinerU 自部署服务已创建解析任务 task=%s", task_id)
-        return task_id, file_id, upload
+        return task_id, file_id, task_status, upload
 
-    async def _put_bytes(self, path: str, upload: dict[str, Any]) -> None:
+    async def _put_bytes(self, path: str, upload: dict[str, Any]) -> bool:
         upload_url = upload.get("url")
         if not _non_empty(upload_url):
             raise UpstreamError("MinerU 上传响应缺少有效的 PUT 上传地址")
@@ -185,7 +190,16 @@ class SelfHostedMinerUClient(MinerU302Client):
             raise ServiceUnavailableError("上传文件到 MinerU 超时") from exc
         except httpx.RequestError as exc:
             raise ServiceUnavailableError(f"无法上传文件到 MinerU：{exc}") from exc
+        if response.status_code in {404, 410}:
+            raise _ResourceLost(mineru_core._error_message(response))
+        if response.status_code == 409:
+            log.warning(
+                "MinerU 上传返回 409，改为查询任务快照确认状态：%s",
+                mineru_core._error_message(response),
+            )
+            return True
         self._checked(response, "上传文件到 MinerU")
+        return True
 
     async def _poll_task(
         self,

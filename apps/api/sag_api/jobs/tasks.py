@@ -86,7 +86,7 @@ _DELETE_CONTROL_STATES = {
     DocumentStatus.DELETING,
     DocumentStatus.DELETE_FAILED,
 }
-_PARSER_UPLOAD_STATES = {"uploading", "uploaded"}
+_PARSER_UPLOAD_STATES = {"uploading", "uploaded", "waiting-file"}
 _PARSER_QUEUE_STATES = {"created", "pending", "queued", "queueing"}
 _PARSER_DONE_STATES = {"done", "success", "succeeded", "completed", "finished"}
 _PARSER_FAILED_STATES = {"failed", "failure", "error", "cancelled", "canceled", "fallback_failed"}
